@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Screen and Camera Background Replacement with Recording</title>
+    <style>
+      body {
+        margin: 0;
+        overflow: hidden;
+      }
+      #controls {
+        position: absolute;
+        top: 10px;
+        left: 10px;
+        z-index: 1000;
+      }
+      button {
+        margin: 5px;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="controls">
+      <button id="startRecordingBtn">Start Recording</button>
+      <button id="stopRecordingBtn" style="display: none">
+        Stop Recording
+      </button>
+    </div>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation/selfie_segmentation.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+    <script>
+      const canvasElement = document.createElement("canvas");
+      const canvasCtx = canvasElement.getContext("2d");
+      const startRecordingBtn = document.getElementById("startRecordingBtn");
+      const stopRecordingBtn = document.getElementById("stopRecordingBtn");
+      const videoElement = document.createElement("video");
+      const worker = new Worker("worker.js");
+      let isPost = true;
+      let cameraStream;
+      let screenStream;
+      let screenVideo;
+      let mediaRecorder;
+      let recordedChunks = [];
+
+      async function startScreenCapture() {
+        try {
+          screenStream = await navigator.mediaDevices.getDisplayMedia({
+            video: true,
+            audio: true,
+          });
+          screenVideo = document.createElement("video");
+          screenVideo.srcObject = screenStream;
+          screenVideo.play();
+          screenStream.getVideoTracks()[0].addEventListener("ended", () => {
+            stopRecording();
+            alert("Screen sharing stopped");
+          });
+          return screenVideo;
+        } catch (error) {
+          console.error("Error capturing screen:", error);
+        }
+      }
+
+      let diff = 0;
+      let lastTime = Date.now();
+      function onResults(results) {
+        console.log("diff", Date.now() - lastTime);
+        lastTime = Date.now();
+        console.log(screenVideo.videoWidth, screenVideo.videoHeight)
+        canvasElement.width = screenVideo.videoWidth;
+        canvasElement.height = screenVideo.videoHeight;
+        canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+        canvasCtx.save();
+        const smallVideoWidth = screenVideo.videoWidth/4;
+        const smallVideoHeight = screenVideo.videoHeight/4;
+        canvasCtx.drawImage(
+          results.image,
+          0,
+          0,
+          videoElement.videoWidth,
+          videoElement.videoHeight,
+          10,
+          canvasElement.height - smallVideoHeight - 10,
+          smallVideoWidth,
+          smallVideoHeight
+        );
+        canvasCtx.globalCompositeOperation = "destination-atop";
+        canvasCtx.drawImage(
+          results.segmentationMask,
+          0,
+          0,
+          videoElement.videoWidth,
+          videoElement.videoHeight,
+          10,
+          canvasElement.height - smallVideoHeight - 10,
+          smallVideoWidth,
+          smallVideoHeight
+        );
+
+        //Draw the screen capture as the background
+        canvasCtx.globalCompositeOperation = "destination-over";
+        if (screenVideo) {
+          canvasCtx.drawImage(
+            screenVideo,
+            0,
+            0,
+            canvasElement.width,
+            canvasElement.height
+          );
+        }
+
+        canvasCtx.restore();
+      }
+
+      const selfieSegmentation = new SelfieSegmentation({
+        locateFile: (file) =>
+          `https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation/${file}`,
+      });
+      selfieSegmentation.setOptions({
+        modelSelection: 1,
+        categoryMask: true,
+      });
+      selfieSegmentation.onResults(onResults);
+
+      async function startCameraStream() {
+        console.log("INSIDE camera");
+        navigator.mediaDevices
+          .getUserMedia({ video: true })
+          .then(async (stream) => {
+            cameraStream = stream;
+            videoElement.srcObject = stream;
+            videoElement.play();
+            videoElement.onloadedmetadata = async () => {
+              if (videoElement.videoWidth > 0 && videoElement.videoHeight > 0) {
+                worker.postMessage({ start: true });
+              }
+            };
+          })
+          .catch((error) => {
+            console.error("Error accessing the camera:", error);
+          });
+        worker.onmessage = async (streamArray) => {
+          if (isPost) await selfieSegmentation.send({ image: videoElement });
+          else {
+            worker.postMessage({ start: false });
+          }
+        };
+      }
+
+      function setupRecording() {
+        const stream = canvasElement.captureStream(60);
+        mediaRecorder = new MediaRecorder(stream, {
+          mimeType: "video/webm; codecs=vp8",
+        });
+        mediaRecorder.ondataavailable = (event) => {
+          if (event.data.size > 0) {
+            recordedChunks.push(event.data);
+          }
+        };
+        mediaRecorder.onstop = () => {
+          if (recordedChunks.length > 0) {
+            const blob = new Blob(recordedChunks, { type: "video/webm" });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement("a");
+            a.href = url;
+            a.download = "recorded-video.webm";
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+            recordedChunks = [];
+            startRecordingBtn.style.display = "block";
+            stopRecordingBtn.style.display = "none";
+          } else {
+            alert("No video data to download.");
+          }
+        };
+        mediaRecorder.start();
+        startRecordingBtn.style.display = "none";
+        stopRecordingBtn.style.display = "block";
+      }
+
+      startRecordingBtn.addEventListener("click", async () => {
+        isPost = true;
+        await startScreenCapture();
+        await startCameraStream();
+        setupRecording();
+      });
+
+      stopRecordingBtn.addEventListener("click", () => {
+        isPost = false;
+        if (mediaRecorder && mediaRecorder.state === "recording") {
+          mediaRecorder.stop();
+        }
+        if (screenStream) {
+          screenStream.getTracks().forEach((track) => track.stop());
+        }
+        stopRecording();
+        if (cameraStream) {
+          cameraStream.getTracks().forEach((track) => {
+            track.stop();
+          });
+        }
+      });
+
+      function stopRecording() {
+        if (mediaRecorder && mediaRecorder.state === "recording") {
+          mediaRecorder.stop();
+        }
+        if (screenStream) {
+          screenStream.getTracks().forEach((track) => track.stop());
+        }
+      }
+
+      window.addEventListener("beforeunload", () => {
+        stopRecording();
+      });
+      document.addEventListener("visibilitychange", () => {
+        if (document.visibilityState === "hidden") {
+          if (screenVideo && screenVideo.paused) {
+            screenVideo.play();
+          }
+        }
+      });
+    </script>
+  </body>
+</html>
